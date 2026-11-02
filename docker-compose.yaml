@@ -1,0 +1,11 @@
+services:
+  propwire-scraper:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      # Optional — on a cloud server Propwire's anti-bot refuses the property
+      # search, so set a US residential proxy here.
+      # - PROPWIRE_PROXY=http://user:pass@host:port
