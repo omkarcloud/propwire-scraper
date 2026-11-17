@@ -31,7 +31,7 @@ PROPWIRE_SESSION_TTL = 100 * 60
 PROPWIRE_PROXY = os.environ.get("PROPWIRE_PROXY") or None
 
 
-def propwire_proxy():
+def propwire_proxy(*args, **kwargs):
     """The proxy for one property-search session (None = direct)."""
     return os.environ.get("PROPWIRE_PROXY") or None
 
@@ -39,3 +39,15 @@ def propwire_proxy():
 def propwire_web_proxy():
     """The proxy for one session on every other surface (None = direct)."""
     return os.environ.get("PROPWIRE_PROXY") or None
+
+
+# ---- added by the sync: defaults for a direct run ----
+PROPWIRE_EXIT = None
+PROPWIRE_FALLBACK_EXIT = None
+PROPWIRE_GATEWAY_PAUSE = 900
+PROPWIRE_GATEWAY_REFUSALS = 2
+PROPWIRE_GATEWAY_SESSION_USES = 8
+PROPWIRE_SESSION_USES = 40
+def gateway_exit(exit=None):
+    return None
+

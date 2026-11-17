@@ -12,17 +12,31 @@ first GETs the homepage once, which mints what the calls need:
   * the `datadome` cookie, which api.propwire.com/api/property_search
     requires (a captcha 403 without it).
 
-Two session kinds, one of each per thread (config's "--- Propwire ---"
-block, pod probe 2026-10-31):
+Two session kinds (config's "--- Propwire ---" block, pod probe
+2026-10-31), each a key of ONE process-wide identity_pool.Pool in exclusive
+mode (since 2026-11-09): a request borrows a session of its kind for one
+call and hands it back, so the next request on any of the pod's 64 threads
+reuses its homepage-minted guest JWT instead of minting its own (before,
+each thread minted one of each kind). A session is retired on any
+retryable failure (`dead`, so the retry mints on a fresh exit), after
+PROPWIRE_SESSION_USES calls, or at PROPWIRE_SESSION_TTL (the JWT's life):
 
   * WEB     propwire.com JSON (property-details, people-search, profiles,
             local_markets) and api.propwire.com/api/auto_complete — open
             from the pod's own IP; config.PROPWIRE_WEB_EXIT ("direct").
   * SEARCH  api.propwire.com/api/property_search — DataDome refuses the
             pod's own IP and every datacenter exit for every curl TLS
-            profile, and passes 4 of 6 US residential exits; one sticky US
-            residential exit per session, dropped on a block so the retry
-            rides a fresh one; config.PROPWIRE_EXIT ("us").
+            profile, and passes 4 of 6 US residential exits. Since
+            2026-11-11 the session rides the shared gateway exit
+            (config.PROPWIRE_EXIT = "gateway", exit_gateway.py: every request
+            leaves from a fresh gateway address; the guest JWT and the datadome
+            cookie the homepage minted from one address are honoured from
+            the next ones, numbers in config.py). The residential exit
+            stays behind it (config.PROPWIRE_FALLBACK_EXIT = "us", pool key
+            SEARCH_FALLBACK, one sticky exit per session as before): the
+            LAST retry of a call rides it, and after
+            PROPWIRE_GATEWAY_REFUSALS refusals in a row on the gateway
+            every search call does for PROPWIRE_GATEWAY_PAUSE seconds.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   PropwireUpstreamError  transport failure / 5xx                — retryable
@@ -43,6 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 import egress
+import identity_pool
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from propwire import parsers
 from propwire.refs import API, SITE
@@ -54,10 +69,16 @@ from propwire.refs import API, SITE
 # served safari17_0. chrome136 / edge101 / firefox135 are refused outright.
 IMPERSONATE_PROFILES = ("chrome", "safari17_0")
 IMPERSONATE = IMPERSONATE_PROFILES[0]
+# Through the gateway exit the TLS is the gateway's for every profile; what a profile
+# changes there is the header set, and DataDome refuses chrome's at the
+# homepage (403 on 9 of 9 mints) and serves safari17_0's (200 on 9 of 9),
+# 2026-11-11. So a gateway session tries safari17_0 first.
+GATEWAY_PROFILES = ("safari17_0", "chrome")
 PAGE_TIMEOUT = 30      # the homepage is ~240 KB
 JSON_TIMEOUT = 30
 
-WEB, SEARCH = "web", "search"
+# pool keys: SEARCH_FALLBACK = property_search sessions on the exit behind the gateway
+WEB, SEARCH, SEARCH_FALLBACK = "web", "search", "search-fallback"
 
 # membership-only lead types: the API's own refusal codes (never retried)
 _MEMBERSHIP_ERRORS = ("PremiumLeadsForbidden", "NewPremiumForbidden", "GoldForbidden",
@@ -80,29 +101,41 @@ class PropwireNotFound(NotFound):
     """Unknown property / profile — never retried."""
 
 
-# ---- sessions ------------------------------------------------------------------
+# ---- pooled sessions -------------------------------------------------------------
 
-class _State:
-    __slots__ = ("session", "token", "minted_at", "proxy")
+class _Session(identity_pool.Identity):
+    """One warmed curl session (`session`) with the guest JWT (`token`) it
+    minted; the pool (identity_pool.Identity) keeps budget / age / refusal.
+    The curl handle is used by one request at a time (exclusive lending)."""
 
     def __init__(self, session, token, proxy):
+        super().__init__(exit=proxy)
         self.session, self.token, self.proxy = session, token, proxy
-        self.minted_at = time.monotonic()
+        self.closed = False
 
-
-_local = threading.local()
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
 
 def _proxy_for(kind):
+    if kind == SEARCH_FALLBACK:
+        return config.propwire_proxy(fallback=True)
     return config.propwire_proxy() if kind == SEARCH else config.propwire_web_proxy()
 
 
-def _mint(kind):
-    """A new curl session on a fresh exit, warmed on the homepage. A refused
-    homepage tries the next TLS profile on the same exit before raising."""
+def _mint(kind, hint=None):
+    """The pool's mint: a new curl session on a fresh exit, warmed on the
+    homepage. A refused homepage tries the next TLS profile on the same exit
+    before raising (the pool passes the error through; nothing is lent)."""
     proxy = _proxy_for(kind)
     blocked = None
-    for profile in IMPERSONATE_PROFILES:
+    for profile in (GATEWAY_PROFILES if config.gateway_exit(proxy) else IMPERSONATE_PROFILES):
         try:
             return _mint_with(profile, proxy)
         except PropwireBlocked as e:
@@ -111,10 +144,8 @@ def _mint(kind):
 
 
 def _mint_with(profile, proxy):
-    from curl_cffi import requests as curl_requests
-    sess = curl_requests.Session(impersonate=profile)
-    if proxy:
-        sess.proxies = {"http": proxy, "https": proxy}
+    # None, a proxy URL, or the gateway exit ("gateway")
+    sess = egress.new_session(proxy, impersonate=profile, use_thread_local_curl=False)
     headers = {
         "accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
                    "image/avif,image/webp,*/*;q=0.8"),
@@ -138,32 +169,96 @@ def _mint_with(profile, proxy):
         sess.close()
         raise PropwireBlocked(f"homepage carried no guest token: {e}")
     sess.headers["accept-language"] = headers["accept-language"]
-    return _State(sess, token, proxy)
+    return _Session(sess, token, proxy)
 
 
-def _state(kind):
-    states = getattr(_local, "states", None)
-    if states is None:
-        states = _local.states = {}
-    state = states.get(kind)
-    if state is not None and time.monotonic() - state.minted_at > config.PROPWIRE_SESSION_TTL:
-        _drop_session(kind)
-        state = None
-    if state is None:
-        state = states[kind] = _mint(kind)
-    return state
+# Exclusive lending per kind (WEB / SEARCH): a session owns its curl handle,
+# so one request at a time; the JWT's life is the pool's max_age.
+_sessions = identity_pool.Pool(
+    "propwire", _mint, mode="exclusive",
+    budget=lambda: config.PROPWIRE_SESSION_USES,
+    max_age=lambda: config.PROPWIRE_SESSION_TTL,
+    on_retire=lambda ident, reason: ident.close())
 
 
-def _drop_session(kind):
-    """Close the thread's session of one kind so the retry mints a new one
-    (on a fresh exit for the SEARCH kind)."""
-    states = getattr(_local, "states", None) or {}
-    state = states.pop(kind, None)
-    if state is not None:
-        try:
-            state.session.close()
-        except Exception:
-            pass
+# ---- the gateway in front of the residential search exit ---------------------------
+# property_search rides config.PROPWIRE_EXIT (the gateway exit) with
+# config.PROPWIRE_FALLBACK_EXIT (a sticky US residential exit) behind it.
+# The gateway's exit changes every request, so ONE refusal there is no
+# verdict on it (the retry leaves from other addresses); a run of them is:
+# then the gateway is paused and every search call rides the residential
+# exit, as all of them did before 2026-11-11. A gateway session is retired
+# after PROPWIRE_GATEWAY_SESSION_USES search calls: DataDome answers the
+# captcha 403 once one session (its datadome cookie) has asked from about a
+# dozen addresses (3 of 3 sessions: 11, 12 and 11 calls served, the next
+# one refused, 2026-11-11), which a sticky residential exit never shows it.
+_local = threading.local()          # .last_retry: this thread's call is on its last retry
+_gateway = {"refusals": 0, "paused_until": 0.0}
+_gateway_lock = threading.Lock()
+
+
+def _gateway_in_front():
+    """True when property_search has the gateway in front of another exit."""
+    return bool(config.gateway_exit(config.PROPWIRE_EXIT) and config.PROPWIRE_FALLBACK_EXIT)
+
+
+def _pool_key(kind):
+    """The pool key a call of `kind` borrows from now: a property_search
+    call moves to SEARCH_FALLBACK for its last retry and while the gateway
+    is paused."""
+    if kind == SEARCH and _gateway_in_front() and (
+            getattr(_local, "last_retry", False) or time.monotonic() < _gateway["paused_until"]):
+        return SEARCH_FALLBACK
+    return kind
+
+
+def _note_gateway(refused):
+    """Count a property_search answer through the gateway: a success clears
+    the run, the PROPWIRE_GATEWAY_REFUSALS-th refusal in a row pauses the
+    gateway for PROPWIRE_GATEWAY_PAUSE seconds."""
+    with _gateway_lock:
+        if not refused:
+            _gateway["refusals"] = 0
+            return
+        _gateway["refusals"] += 1
+        if _gateway["refusals"] < max(1, int(config.PROPWIRE_GATEWAY_REFUSALS)):
+            return
+        _gateway["refusals"] = 0
+        _gateway["paused_until"] = time.monotonic() + config.PROPWIRE_GATEWAY_PAUSE
+    print(f"propwire: the gateway exit was refused {config.PROPWIRE_GATEWAY_REFUSALS} times in a row; "
+          f"property_search rides {config.PROPWIRE_FALLBACK_EXIT} for {config.PROPWIRE_GATEWAY_PAUSE} s")
+
+
+def _on_session(kind, fn):
+    """fn(state) on a borrowed session of `kind`. A retryable failure
+    (PropwireUpstreamError, so Blocked too) marks it dead: retired on
+    give-back, and the retry mints a new one (on a fresh exit for SEARCH)."""
+    key = _pool_key(kind)
+    on_gateway = key == SEARCH and bool(config.gateway_exit(config.PROPWIRE_EXIT))  # a property_search call through the gateway
+    counted = on_gateway and _gateway_in_front()        # ... whose refusals pause it (an exit sits behind it)
+    try:
+        state = _sessions.borrow(key)
+    except PropwireBlocked:
+        if counted:
+            _note_gateway(refused=True)                 # the homepage mint was refused
+        raise
+    try:
+        result = fn(state)
+        if on_gateway and state.uses.get("use", 0) >= max(1, int(config.PROPWIRE_GATEWAY_SESSION_USES)):
+            state.expires_at = time.time()              # spent: give_back retires it, the next call mints
+    except PropwireBlocked:
+        state.dead = True
+        if counted:
+            _note_gateway(refused=True)
+        raise
+    except PropwireUpstreamError:
+        state.dead = True
+        raise
+    finally:
+        _sessions.give_back(state)
+    if counted:
+        _note_gateway(refused=False)
+    return result
 
 
 def _cookie(sess, name):
@@ -179,20 +274,26 @@ def _cookie(sess, name):
     return unquote(value) if value else ""
 
 
-def _retrying(fn, kind):
+def _retrying(fn):
     """Run fn() under the shared retry policy: PropwireUpstreamError (and so
-    Blocked) drops the session and retries; NotFound / BadRequest surface
-    at once."""
+    Blocked) retries — the failed call already retired its session
+    (_on_session), or its mint failed and nothing was lent; NotFound /
+    BadRequest surface at once. The last retry is flagged (_local.last_retry)
+    so a property_search call the gateway keeps failing — refused, or the
+    gateway's own errors — ends on the residential exit (_pool_key)."""
     last = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            return fn()
-        except PropwireUpstreamError as e:
-            last = e
-            _drop_session(kind)
-            if attempt < config.MAX_RETRIES:
-                time.sleep(config.RETRY_BACKOFF * attempt)
-    raise last
+    try:
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            _local.last_retry = 1 < attempt == config.MAX_RETRIES
+            try:
+                return fn()
+            except PropwireUpstreamError as e:
+                last = e
+                if attempt < config.MAX_RETRIES:
+                    time.sleep(config.RETRY_BACKOFF * attempt)
+        raise last
+    finally:
+        _local.last_retry = False
 
 
 # ---- the response taxonomy --------------------------------------------------------
@@ -261,25 +362,23 @@ def _web_headers(state):
 
 
 def _post(kind, url, body, label, headers_for):
-    def once():
-        state = _state(kind)
+    def once(state):
         try:
             resp = state.session.post(url, json=body, headers=headers_for(state), timeout=JSON_TIMEOUT)
         except Exception as e:
             raise PropwireUpstreamError(f"request failed for {label}: {type(e).__name__}: {e}")
         return _classify(resp, label)
-    return _retrying(once, kind)
+    return _retrying(lambda: _on_session(kind, once))
 
 
 def _get(kind, url, label, headers_for, params=None):
-    def once():
-        state = _state(kind)
+    def once(state):
         try:
             resp = state.session.get(url, headers=headers_for(state), params=params, timeout=JSON_TIMEOUT)
         except Exception as e:
             raise PropwireUpstreamError(f"request failed for {label}: {type(e).__name__}: {e}")
         return _classify(resp, label)
-    return _retrying(once, kind)
+    return _retrying(lambda: _on_session(kind, once))
 
 
 # ---- the surfaces ---------------------------------------------------------------------

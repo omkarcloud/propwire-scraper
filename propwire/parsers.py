@@ -32,11 +32,12 @@ site's own placeholders ("Unknown", "Type Not Specified", "NEED TO MAP",
 "NOT DECLARED") are null too.
 """
 import html
-import json
+import fastjson
 import re
 
 from propwire.refs import (AUTOCOMPLETE_TYPE_NAMES, PROPERTY_TYPE_NAMES, SITE, person_link,
                            property_link)
+from scraper_utils.values import number as _num, to_int as _int
 
 # the site's own "no value" markers
 _UNKNOWN = {"", "unknown", "type not specified", "need to map", "not declared", "n/a", "na", "none"}
@@ -57,24 +58,6 @@ def _clean(value):
     return None if text.lower() in _UNKNOWN else text
 
 
-def _num(value):
-    """int / float / numeric string -> number (int when whole); else None."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value) if value.is_integer() else value
-    text = _clean(value)
-    if text is None:
-        return None
-    try:
-        number = float(text.replace(",", ""))
-    except ValueError:
-        return None
-    return int(number) if number.is_integer() else number
-
-
 def _code(value):
     """An identifier the site may send as a number (census tract 7702) -> str."""
     if isinstance(value, bool):
@@ -89,11 +72,6 @@ def _fips(value):
     leading zero ("6037" for Los Angeles, 2026-11-02), so pad it back."""
     code = _code(value)
     return code.zfill(5) if code and code.isdigit() and len(code) < 5 else code
-
-
-def _int(value):
-    number = _num(value)
-    return int(number) if isinstance(number, (int, float)) else None
 
 
 def _bool(value):
@@ -166,7 +144,7 @@ def parse_inertia_props(page_html):
     if not match:
         raise ValueError("no Inertia data-page attribute in the page")
     try:
-        page = json.loads(html.unescape(match.group(1)))
+        page = fastjson.loads(html.unescape(match.group(1)))
     except ValueError:
         raise ValueError("the data-page attribute is not JSON")
     props = page.get("props") if isinstance(page, dict) else None

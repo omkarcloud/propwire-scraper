@@ -21,6 +21,7 @@ the property-type and sort tokens from the search bundle
 api.propwire.com/api/property_search.
 """
 import json
+import fastjson
 import re
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -250,7 +251,7 @@ def parse_search_link(url):
         raise ValueError("Must be a propwire.com search link (https://propwire.com/search?filters=...).")
     raw = (parse_qs(parsed.query).get("filters") or [None])[0]
     try:
-        filters = json.loads(unquote(raw)) if raw else None
+        filters = fastjson.loads(unquote(raw)) if raw else None
     except ValueError:
         filters = None
     if not isinstance(filters, dict):
